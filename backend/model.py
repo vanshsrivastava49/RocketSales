@@ -185,7 +185,48 @@ class PricingEngine:
         price_low   = round(recommended * 0.9 / 10) * 10
         price_high  = round(recommended * 1.1 / 10) * 10
 
-        confidence  = min(90 + (5 if self.is_trained else 0), 97)
+        # Dynamic confidence score (no longer constant):
+        # combines model quality (MAPE), input completeness, and demand signal.
+        provided_fields = [
+            data.get("current_price"),
+            data.get("market_price"),
+            data.get("competitor_price"),
+            data.get("rating"),
+            data.get("rating_count"),
+            data.get("description"),
+        ]
+        coverage = sum(
+            1 for v in provided_fields
+            if v is not None and str(v).strip().lower() not in ("", "nan", "none")
+        ) / len(provided_fields)
+
+        rating_count_safe = max(float(rating_count or 0), 0.0)
+        demand_signal = min(
+            np.log1p(rating_count_safe) / np.log1p(50000),
+            1.0,
+        )
+
+        if self.is_trained and self._mape is not None:
+            # Lower MAPE => higher trust
+            model_quality = max(0.0, min(1.0, (100.0 - float(self._mape)) / 100.0))
+        else:
+            model_quality = 0.35
+
+        confidence = (
+            55.0
+            + 22.0 * model_quality
+            + 12.0 * coverage
+            + 8.0 * demand_signal
+        )
+
+        if not self.is_trained:
+            confidence -= 8.0
+        if data.get("competitor_price") in (None, "", 0):
+            confidence -= 3.0
+        if rating_count_safe < 10:
+            confidence -= 2.0
+
+        confidence = round(float(np.clip(confidence, 55.0, 97.0)), 1)
 
         change_pct = None
         if data.get("current_price"):

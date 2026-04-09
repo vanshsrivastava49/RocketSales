@@ -276,6 +276,7 @@ async def predict_bulk(
 
     results    = []
     row_errors = []
+    history_docs=[]
 
     for idx, row in df.iterrows():
         row_num = int(idx) + 2
@@ -312,6 +313,21 @@ async def predict_bulk(
                 "confidence":        pred["confidence"],
                 "change_pct":        pred["insights"].get("change_from_current"),
             })
+            history_docs.append({
+                "user_id":           str(current_user["_id"]),
+                "product_name":      record["product_name"],
+                "category":          record["category"],
+                "brand":             record["brand"],
+                "current_price":     record["current_price"],
+                "recommended_price": pred["recommended_price"],
+                "price_low":         pred["price_low"],
+                "price_high":        pred["price_high"],
+                "confidence":        pred["confidence"],
+                "change_pct":        pred["insights"].get("change_from_current"),
+                "factors":           pred.get("factors", []),
+                "ai_analysis":       None,
+                "created_at":        datetime.utcnow(),
+            })
         except Exception as e:
             row_errors.append({
                 "row":          row_num,
@@ -322,11 +338,16 @@ async def predict_bulk(
     summary = _bulk_summary(results)
     logger.info(f"[{request_id}] Bulk complete: {len(results)} success, {len(row_errors)} errors")
 
-    if results:
-        await db.users.update_one(
-            {"_id": current_user["_id"]},
-            {"$inc": {"products_analyzed": len(results)}},
-        )
+    if history_docs:
+        try:
+            await db.products.insert_many(history_docs, ordered=False)
+            await db.users.update_one(
+                {"_id": current_user["_id"]},
+                {"$inc": {"products_analyzed": len(history_docs)},
+                 "$set": {"updated_at": datetime.utcnow()}},
+            )
+        except Exception as e:
+            logger.warning(f"[{request_id}] Could not persist bulk history: {e}")
 
     return {
         "request_id":    request_id,
@@ -354,9 +375,6 @@ async def export_my_products(current_user: dict = Depends(get_current_user)):
         # CSV-serialisable and silently crashes the writer on some Motor versions.
         doc.pop("_id", None)
         products.append(doc)
-
-    if not products:
-        raise HTTPException(status_code=404, detail="No product history to export")
 
     output = io.StringIO()
     writer = csv.DictWriter(

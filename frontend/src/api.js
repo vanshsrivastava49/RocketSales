@@ -104,9 +104,17 @@ export const fetchMyTrends = (days = 30) =>
 // also needs to be removed after the click to avoid leaking DOM nodes on
 // repeated exports.
 export const exportProducts = async () => {
-  const res = await api.get('/my/products/export', {
-    responseType: 'blob',
-  })
+  let res
+  try {
+    res = await api.get('/my/products/export', {
+      responseType: 'blob',
+    })
+  } catch (err) {
+    if (err?.response?.status !== 404) throw err
+    res = await api.get('/api/my/products/export', {
+      responseType: 'blob',
+    })
+  }
 
   const url      = URL.createObjectURL(new Blob([res.data], { type: 'text/csv' }))
   const filename = res.headers['content-disposition']
