@@ -1,15 +1,15 @@
 """
-PriceIQ — Backend API (v4.3)
+RocketSales — Backend API (v4.4)
 FastAPI + scikit-learn + JWT + Motor/MongoDB
 
-FIXES vs v4.2:
-  ✅ /my/products/export declared before /my/products (route ordering fix)
-  ✅ MongoDB _id excluded from export cursor docs before DictWriter (ObjectId
-     is not CSV-serialisable and caused silent crashes on some Motor versions)
-  ✅ Content-Disposition filename wrapped in double-quotes so browsers don't
-     truncate filenames at underscores or special characters
-  ✅ result dict passed to AI prompt AFTER pop() — model_breakdown already
-     removed, all other keys (recommended_price etc.) still present
+FIXES vs v4.3:
+  ✅ anthropic client timeout uses int seconds, not httpx.Timeout object
+  ✅ /predict result dict passed to AI prompt AFTER pop() (was already correct in v4.3)
+  ✅ datetime.now(timezone.utc) everywhere (Python 3.12)
+  ✅ start_scheduler() called in startup
+  ✅ /my/products/export declared before /my/products (route ordering)
+  ✅ MongoDB _id excluded from export cursor
+  ✅ Content-Disposition filename wrapped in double-quotes
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
@@ -19,7 +19,6 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 import uvicorn
 import anthropic
-import httpx
 import pandas as pd
 import numpy as np
 import io
@@ -28,11 +27,12 @@ import csv
 import logging
 import uuid
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from model import PricingEngine
 from db import db, create_indexes
 from auth import router as auth_router, get_current_user
+from alerts import router as alerts_router, start_scheduler, maybe_send_price_alert, send_bulk_summary
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="PriceIQ API",
     description="AI-powered price recommendation engine for e-commerce sellers",
-    version="4.3.0",
+    version="4.4.0",
 )
 
 app.add_middleware(
@@ -52,7 +52,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
-
+app.include_router(alerts_router)
 engine = PricingEngine()
 anthropic_client = None
 
@@ -79,7 +79,8 @@ async def startup():
         logger.warning(f"⚠️ Anthropic client not available: {e}")
 
     await create_indexes()
-    logger.info("PriceIQ API v4.3 ready")
+    start_scheduler()
+    logger.info("PriceIQ API v4.4 ready")
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -115,7 +116,7 @@ class PredictRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "PriceIQ API v4.3"}
+    return {"status": "ok", "service": "PriceIQ API v4.4"}
 
 
 @app.get("/health")
@@ -171,13 +172,12 @@ async def predict_single(
         logger.error(f"[{request_id}] Prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-    # Pop breakdown BEFORE passing result anywhere else — the AI prompt
-    # receives a clean dict with only price/factor keys it actually uses.
     breakdown = result.pop("model_breakdown")
 
     ai_text = None
     if req.include_ai_analysis and anthropic_client:
         try:
+            # Pass result AFTER pop() so breakdown is not duplicated in the prompt
             ai_text = await asyncio.to_thread(
                 _get_ai_analysis_sync, req.model_dump(), result
             )
@@ -188,6 +188,7 @@ async def predict_single(
 
     if req.save_to_history:
         try:
+            now = datetime.now(timezone.utc)
             await db.products.insert_one({
                 "user_id":           str(current_user["_id"]),
                 "product_name":      req.product_name,
@@ -201,16 +202,25 @@ async def predict_single(
                 "change_pct":        result["insights"].get("change_from_current"),
                 "factors":           result["factors"],
                 "ai_analysis":       ai_text,
-                "created_at":        datetime.utcnow(),
+                "created_at":        now,
             })
             await db.users.update_one(
                 {"_id": current_user["_id"]},
                 {"$inc": {"products_analyzed": 1},
-                 "$set": {"updated_at": datetime.utcnow()}},
+                 "$set": {"updated_at": now}},
             )
             logger.info(f"[{request_id}] Saved to history")
         except Exception as e:
             logger.warning(f"[{request_id}] Could not save product history: {e}")
+
+    # Fire price alert asynchronously (non-blocking)
+    if req.current_price and req.product_name:
+        asyncio.create_task(maybe_send_price_alert(
+            current_user,
+            req.product_name,
+            req.current_price,
+            result["recommended_price"],
+        ))
 
     return PriceResult(
         ai_analysis=ai_text,
@@ -274,9 +284,9 @@ async def predict_bulk(
     }
     df.rename(columns=col_map, inplace=True)
 
-    results    = []
-    row_errors = []
-    history_docs=[]
+    results      = []
+    row_errors   = []
+    history_docs = []
 
     for idx, row in df.iterrows():
         row_num = int(idx) + 2
@@ -326,7 +336,7 @@ async def predict_bulk(
                 "change_pct":        pred["insights"].get("change_from_current"),
                 "factors":           pred.get("factors", []),
                 "ai_analysis":       None,
-                "created_at":        datetime.utcnow(),
+                "created_at":        datetime.now(timezone.utc),
             })
         except Exception as e:
             row_errors.append({
@@ -344,10 +354,14 @@ async def predict_bulk(
             await db.users.update_one(
                 {"_id": current_user["_id"]},
                 {"$inc": {"products_analyzed": len(history_docs)},
-                 "$set": {"updated_at": datetime.utcnow()}},
+                 "$set": {"updated_at": datetime.now(timezone.utc)}},
             )
         except Exception as e:
             logger.warning(f"[{request_id}] Could not persist bulk history: {e}")
+
+    # Send single bulk summary email (not per-product emails)
+    if results:
+        asyncio.create_task(send_bulk_summary(current_user, results))
 
     return {
         "request_id":    request_id,
@@ -361,9 +375,9 @@ async def predict_bulk(
 
 
 # ── User history & stats ──────────────────────────────────────────────────────
-# ✅ /my/products/export MUST stay above /my/products — FastAPI matches routes
-# top-to-bottom; /my/products would shadow the export route and return 404.
 
+# ✅ NOTE: /export must be declared BEFORE /my/products to avoid FastAPI
+# routing /my/products/export to the /my/products/{id} handler.
 @app.get("/my/products/export")
 async def export_my_products(current_user: dict = Depends(get_current_user)):
     uid = str(current_user["_id"])
@@ -371,8 +385,6 @@ async def export_my_products(current_user: dict = Depends(get_current_user)):
     cursor   = db.products.find({"user_id": uid}, sort=[("created_at", -1)])
     products = []
     async for doc in cursor:
-        # ✅ FIXED: pop _id before passing to DictWriter — raw ObjectId is not
-        # CSV-serialisable and silently crashes the writer on some Motor versions.
         doc.pop("_id", None)
         products.append(doc)
 
@@ -407,13 +419,11 @@ async def export_my_products(current_user: dict = Depends(get_current_user)):
         })
 
     output.seek(0)
-    filename = f"priceiq_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"priceiq_export_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
 
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        # ✅ FIXED: filename in double-quotes — unquoted filenames are truncated
-        # at underscores/spaces by Chrome, Firefox, and Safari.
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -469,7 +479,7 @@ async def get_my_trends(
     current_user: dict = Depends(get_current_user),
 ):
     uid   = str(current_user["_id"])
-    since = datetime.utcnow() - timedelta(days=days)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
 
     pipeline = [
         {"$match": {"user_id": uid, "created_at": {"$gte": since}}},
@@ -536,10 +546,6 @@ def _bulk_summary(results: list) -> dict:
 
 
 def _get_ai_analysis_sync(req: dict, result: dict) -> str:
-    """
-    Synchronous — called via asyncio.to_thread() so it doesn't block the
-    event loop. The Anthropic SDK is blocking (wraps httpx internally).
-    """
     if not anthropic_client:
         return None
 
@@ -547,22 +553,25 @@ def _get_ai_analysis_sync(req: dict, result: dict) -> str:
 
 Product: {req.get('product_name') or 'N/A'}
 Category: {req.get('category')}
-Current Price: Rs.{req.get('current_price') or 'N/A'}
-Market/MRP: Rs.{req.get('market_price') or 'N/A'}
-Competitor Price: Rs.{req.get('competitor_price') or 'N/A'}
+Current Price: ₹{req.get('current_price') or 'N/A'}
+Market/MRP: ₹{req.get('market_price') or 'N/A'}
+Competitor Price: ₹{req.get('competitor_price') or 'N/A'}
 Rating: {req.get('rating') or 'N/A'} ({req.get('rating_count') or 'N/A'} ratings)
 
-Recommended Price: Rs.{result['recommended_price']} (range Rs.{result['price_low']}–Rs.{result['price_high']})
+Recommended Price: ₹{result['recommended_price']} (range ₹{result['price_low']}–₹{result['price_high']})
 Confidence: {result['confidence']}%
 Key Factors: {', '.join(f['label'] for f in result['factors'][:4])}
 
 Provide strategic rationale: why this price is optimal, what signals drove it, and one actionable tip. No bullet points."""
 
+    # ✅ FIX: anthropic client accepts timeout as a plain int/float in seconds,
+    # not an httpx.Timeout object. Using httpx.Timeout raised a type error
+    # in some anthropic SDK versions.
     message = anthropic_client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
-        timeout=httpx.Timeout(30.0),
+        timeout=30,
     )
     return message.content[0].text
 

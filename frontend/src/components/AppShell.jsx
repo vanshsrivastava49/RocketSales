@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { fetchHealth } from '../api'
 import ProfilePage from '../pages/ProfilePage'
@@ -6,9 +6,7 @@ import Dashboard from './Dashboard'
 import SinglePredictor from './SinglePredictor'
 import BulkPredictor from './BulkPredictor'
 import styles from './AppShell.module.css'
-
-// Header.jsx is not mounted anywhere — AppShell owns the header directly.
-// The /health poll is handled here so it's tied to the shell's lifetime.
+import { useAlerts } from '../contexts/AlertsContext'
 
 function ComingSoon({ label }) {
   return (
@@ -23,8 +21,6 @@ function ComingSoon({ label }) {
   )
 }
 
-// Icons added to every nav item — previously all were undefined, causing every
-// <span className={styles.navIcon}> to render as an empty element.
 const NAV_MAIN = [
   { id: 'overview',  label: 'Overview',   icon: '◈' },
   { id: 'analytics', label: 'Analytics',  icon: '↗' },
@@ -41,18 +37,30 @@ const NAV_ACCOUNT = [
 ]
 
 export default function AppShell() {
-  const { user, logout } = useAuth()
-  const [activeNav, setActiveNav] = useState('overview')
-  const [health, setHealth]       = useState(null)
+  const { user, logout }    = useAuth()
+  const { alerts, refresh } = useAlerts()
+  const [showAlerts, setShowAlerts] = useState(false)
+  const [activeNav, setActiveNav]   = useState('overview')
+  const [health, setHealth]         = useState(null)
+  const alertDropdownRef            = useRef(null)
 
-  // Poll /health once on mount to show model status in the header.
-  // Polling here (not in a standalone Header component) so it shares
-  // the shell's lifecycle and isn't duplicated across re-mounts.
   useEffect(() => {
     fetchHealth()
       .then(setHealth)
       .catch(() => setHealth(null))
   }, [])
+
+  // ✅ FIX: close alert dropdown when clicking anywhere outside it
+  useEffect(() => {
+    if (!showAlerts) return
+    const handleClickOutside = (e) => {
+      if (alertDropdownRef.current && !alertDropdownRef.current.contains(e.target)) {
+        setShowAlerts(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [showAlerts])
 
   const initials = (
     (user?.first_name?.[0] || '') + (user?.last_name?.[0] || '')
@@ -61,10 +69,10 @@ export default function AppShell() {
   const renderPage = () => {
     switch (activeNav) {
       case 'overview':  return <Dashboard />
-      case 'analytics': return <Dashboard />      // swap for <Analytics /> when ready
+      case 'analytics': return <Dashboard />
       case 'single':    return <SinglePredictor />
       case 'bulk':      return <BulkPredictor />
-      case 'market':    return <Dashboard />       // swap for <MarketStats /> when ready
+      case 'market':    return <Dashboard />
       case 'profile':   return <ProfilePage />
       case 'settings':  return <ComingSoon label="Settings coming soon" />
       case 'billing':   return <ComingSoon label="Billing coming soon" />
@@ -80,7 +88,6 @@ export default function AppShell() {
           <div className={styles.logo}>Rocket<span>Sales</span></div>
           <span className={styles.badge}>AI v2</span>
 
-          {/* Model health indicator — sourced from GET /health */}
           {health !== null && (
             <div className={styles.healthStatus}>
               <span className={`${styles.healthDot} ${health.model_trained ? styles.dotGreen : styles.dotYellow}`} />
@@ -94,6 +101,119 @@ export default function AppShell() {
         </div>
 
         <div className={styles.headerRight}>
+          {/* ── Alert bell + dropdown ── */}
+          {/* ✅ FIX: ref attached to the wrapper div so outside-click detection works */}
+          <div ref={alertDropdownRef} style={{ position: 'relative', marginRight: 16 }}>
+            <button
+              onClick={() => setShowAlerts(v => !v)}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                fontSize: 18, position: 'relative', padding: '4px 8px',
+                color: showAlerts ? 'var(--accent)' : 'var(--muted2)',
+              }}
+              title="Price alerts"
+              aria-label={`Alerts (${alerts.length} unread)`}
+            >
+              🔔
+              {alerts.length > 0 && (
+                <span style={{
+                  position: 'absolute', top: -2, right: -2,
+                  background: 'var(--accent3)', color: '#fff',
+                  borderRadius: '50%', fontSize: 10,
+                  minWidth: 16, height: 16,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontFamily: 'var(--mono)', lineHeight: 1,
+                }}>
+                  {alerts.length > 99 ? '99+' : alerts.length}
+                </span>
+              )}
+            </button>
+
+            {showAlerts && (
+              <div style={{
+                position: 'absolute', right: 0, top: 36,
+                width: 340, background: 'var(--bg2)',
+                border: '1px solid var(--border2)',
+                borderRadius: 12, padding: 0,
+                zIndex: 200,
+                boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+                overflow: 'hidden',
+              }}>
+                {/* Dropdown header */}
+                <div style={{
+                  padding: '12px 16px', borderBottom: '1px solid var(--border)',
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                }}>
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>Price Alerts</span>
+                  <button
+                    onClick={refresh}
+                    style={{
+                      background: 'none', border: 'none', cursor: 'pointer',
+                      color: 'var(--muted)', fontSize: 11, fontFamily: 'var(--mono)',
+                    }}
+                    title="Refresh alerts"
+                  >
+                    ↻ Refresh
+                  </button>
+                </div>
+
+                {/* Alert list */}
+                <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+                  {alerts.length === 0 ? (
+                    <div style={{
+                      padding: 24, textAlign: 'center',
+                      color: 'var(--muted)', fontSize: 13,
+                    }}>
+                      No alerts yet
+                    </div>
+                  ) : (
+                    alerts.map(a => (
+                      <div key={a.id} style={{
+                        padding: '10px 16px',
+                        borderBottom: '1px solid var(--border)',
+                        display: 'flex', alignItems: 'flex-start', gap: 10,
+                      }}>
+                        <span style={{ fontSize: 16, lineHeight: 1.4 }}>
+                          {a.alert_type === 'drop' ? '⬇️' : a.alert_type === 'rise' ? '⬆️' : '📊'}
+                        </span>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {a.product_name || '—'}
+                          </div>
+                          <div style={{ fontSize: 12, color: 'var(--muted2)', marginTop: 2 }}>
+                            ₹{a.current_price} → ₹{a.recommended_price}
+                          </div>
+                          <div style={{
+                            fontSize: 11, marginTop: 2,
+                            color: a.change_pct >= 0 ? 'var(--accent2)' : 'var(--accent3)',
+                            fontFamily: 'var(--mono)',
+                          }}>
+                            {a.change_pct >= 0 ? '+' : ''}{a.change_pct?.toFixed(1)}% · {a.alert_type}
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {/* Footer link */}
+                {alerts.length > 0 && (
+                  <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', textAlign: 'center' }}>
+                    <button
+                      onClick={() => { setActiveNav('profile'); setShowAlerts(false) }}
+                      style={{
+                        background: 'none', border: 'none', cursor: 'pointer',
+                        color: 'var(--accent)', fontSize: 12, fontFamily: 'var(--mono)',
+                      }}
+                    >
+                      View all in Profile →
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           <div className={styles.userInfo}>
             <div className={styles.userName}>{user?.first_name} {user?.last_name}</div>
             <div className={styles.userPlan}>
@@ -149,7 +269,6 @@ function NavItem({ icon, label, badge, active, onClick }) {
       className={`${styles.navItem} ${active ? styles.navItemActive : ''}`}
       onClick={onClick}
     >
-      {/* icon is now always defined — all nav entries include one */}
       <span className={styles.navIcon}>{icon}</span>
       {label}
       {badge && <span className={styles.navBadge}>{badge}</span>}

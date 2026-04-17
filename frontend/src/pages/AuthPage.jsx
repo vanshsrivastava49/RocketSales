@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
+import { authAPI } from '../api' // ✅ FIX: Imported authAPI for password reset flows
 import toast from 'react-hot-toast'
 import styles from './AuthPage.module.css'
 
@@ -9,32 +10,27 @@ const CATEGORIES = [
   'HomeImprovement', 'OfficeProducts', 'MusicalInstruments', 'Other',
 ]
 
-// Stats shown on the left decorative panel.
-// Each entry now has an explicit `icon` field so the pill renderer
-// never receives `undefined` (was a silent bug — s.icon was always undefined
-// because the array objects had no such key).
 const HERO_STATS = [
-  { val: '12,400+', desc: 'Active sellers',           icon: '🏪' },
+  { val: '12,400+', desc: 'Active sellers',          icon: '🏪' },
   { val: '₹2.8Cr+', desc: 'Revenue optimised today', icon: '💰' },
   { val: '97%',      desc: 'Prediction accuracy',     icon: '🎯' },
 ]
 
-// Proper RFC-5322-lite email check — the previous `includes('@')` accepted
-// strings like "@" or "a@" which the backend would reject, giving a confusing
-// 422 from the server rather than a clear inline error.
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
 }
 
 export default function AuthPage() {
   const { login, signup } = useAuth()
-  const [mode, setMode]       = useState('login')
+  // ✅ FIX: Added 'forgot' and 'reset' modes
+  const [mode, setMode]       = useState('login') 
   const [loading, setLoading] = useState(false)
   const [showPw, setShowPw]   = useState(false)
   const [errors, setErrors]   = useState({})
 
+  // ✅ FIX: Added 'otp' to the form state
   const [form, setForm] = useState({
-    first_name: '', last_name: '', email: '', password: '',
+    first_name: '', last_name: '', email: '', password: '', otp: '',
     store_name: '', category: '', phone: '',
   })
 
@@ -54,13 +50,18 @@ export default function AuthPage() {
     return s
   })()
 
-  // Strength colours map index 0–3 (weak → strong).
   const strengthColors = ['#ff6b6b', '#f5c842', '#7c5cfc', '#00e5b4']
 
   const validate = () => {
     const e = {}
     if (!isValidEmail(form.email)) e.email = 'Enter a valid email address'
-    if (form.password.length < 6)  e.password = 'Min 6 characters'
+    
+    if (mode === 'signup' || mode === 'reset') {
+      if (form.password.length < 6)  e.password = 'Min 6 characters'
+    }
+    if (mode === 'reset' && form.otp.length !== 6) {
+      e.otp = 'Must be 6 digits'
+    }
     if (mode === 'signup') {
       if (!form.first_name.trim()) e.first_name = 'Required'
       if (!form.store_name.trim()) e.store_name = 'Required'
@@ -72,11 +73,12 @@ export default function AuthPage() {
     const errs = validate()
     if (Object.keys(errs).length) { setErrors(errs); return }
     setLoading(true)
+    
     try {
       if (mode === 'login') {
         await login(form.email, form.password)
         toast.success('Welcome back! 🎉')
-      } else {
+      } else if (mode === 'signup') {
         await signup({
           first_name: form.first_name,
           last_name:  form.last_name,
@@ -87,22 +89,27 @@ export default function AuthPage() {
           phone:      form.phone,
         })
         toast.success("Account created! Let's get started 🚀")
+      } else if (mode === 'forgot') {
+        // ✅ FIX: Handle Forgot Password Call
+        await authAPI.forgotPassword(form.email)
+        toast.success("If registered, a reset code was sent to your email")
+        setMode('reset')
+      } else if (mode === 'reset') {
+        // ✅ FIX: Handle Reset Password Call
+        await authAPI.resetPassword(form.email, form.otp, form.password)
+        toast.success("Password reset successfully! Please sign in.")
+        setMode('login')
+        setForm(f => ({ ...f, password: '', otp: '' }))
       }
     } catch (err) {
       const detail = err.response?.data?.detail
-      // Backend may return `detail` as a string or as a structured object
-      // (e.g. the column-validation errors from the bulk endpoint).
-      const msg = typeof detail === 'string'
-        ? detail
-        : (detail?.message ?? 'Something went wrong')
+      const msg = typeof detail === 'string' ? detail : (detail?.message ?? 'Something went wrong')
       toast.error(msg)
     } finally {
       setLoading(false)
     }
   }
 
-  // Allow submitting the form with Enter so keyboard-only users aren't forced
-  // to reach for the mouse. Previously there was no keydown handler at all.
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !loading) handleSubmit()
   }
@@ -110,7 +117,7 @@ export default function AuthPage() {
   const switchMode = (m) => {
     setMode(m)
     setErrors({})
-    setForm(f => ({ ...f, password: '' }))
+    setForm(f => ({ ...f, password: '', otp: '' }))
   }
 
   return (
@@ -140,7 +147,6 @@ export default function AuthPage() {
         <div className={styles.pills}>
           {HERO_STATS.map(s => (
             <div className={styles.pill} key={s.val}>
-              {/* icon is now always defined — previously `s.icon` was undefined */}
               <span className={styles.pillIcon}>{s.icon}</span>
               <div>
                 <div className={styles.pillVal}>{s.val}</div>
@@ -153,12 +159,12 @@ export default function AuthPage() {
 
       {/* Right form */}
       <div className={styles.formSide}>
-        {/* onKeyDown on the container so it captures Enter from any field */}
         <div className={styles.formBox} onKeyDown={handleKeyDown}>
+          
           {/* Tab toggle */}
           <div className={styles.toggle}>
             <button
-              className={mode === 'login' ? styles.toggleActive : ''}
+              className={mode !== 'signup' ? styles.toggleActive : ''}
               onClick={() => switchMode('login')}
             >
               Sign In
@@ -172,12 +178,13 @@ export default function AuthPage() {
           </div>
 
           <h2 className={styles.formTitle}>
-            {mode === 'login' ? 'Welcome back' : 'Start selling smarter'}
+            {mode === 'login' ? 'Welcome back' : mode === 'signup' ? 'Start selling smarter' : mode === 'forgot' ? 'Reset password' : 'Enter reset code'}
           </h2>
           <p className={styles.formSub}>
-            {mode === 'login'
-              ? 'Sign in to your seller dashboard'
-              : 'Create your free seller account in 30 seconds'}
+            {mode === 'login' && 'Sign in to your seller dashboard'}
+            {mode === 'signup' && 'Create your free seller account in 30 seconds'}
+            {mode === 'forgot' && 'Enter your email to receive a 6-digit code'}
+            {mode === 'reset' && `Enter the 6-digit code sent to ${form.email}`}
           </p>
 
           {mode === 'signup' && (
@@ -202,6 +209,7 @@ export default function AuthPage() {
                 value={form.email}
                 onChange={set('email')}
                 placeholder="vansh@mystore.in"
+                disabled={mode === 'reset'} // Disable email editing during OTP entry
               />
             </InputWrap>
           </Field>
@@ -210,11 +218,7 @@ export default function AuthPage() {
             <>
               <Field label="Store / Business Name" error={errors.store_name}>
                 <InputWrap>
-                  <input
-                    value={form.store_name}
-                    onChange={set('store_name')}
-                    placeholder="RocketSales"
-                  />
+                  <input value={form.store_name} onChange={set('store_name')} placeholder="RocketSales" />
                 </InputWrap>
               </Field>
               <div className={styles.row}>
@@ -228,59 +232,87 @@ export default function AuthPage() {
                 </Field>
                 <Field label="Phone (optional)">
                   <InputWrap>
-                    <input
-                      value={form.phone}
-                      onChange={set('phone')}
-                      placeholder="+91 98765..."
-                    />
+                    <input value={form.phone} onChange={set('phone')} placeholder="+91 98765..." />
                   </InputWrap>
                 </Field>
               </div>
             </>
           )}
 
-          <Field label="Password" error={errors.password}>
-            <InputWrap onEye={() => setShowPw(p => !p)} showEye eyeOpen={showPw}>
-              <input
-                type={showPw ? 'text' : 'password'}
-                value={form.password}
-                onChange={set('password')}
-                placeholder="Min 6 characters"
-                style={{ paddingRight: 44 }}
-              />
-            </InputWrap>
-            {mode === 'signup' && form.password && (
-              <div className={styles.strengthBar}>
-                <div
-                  className={styles.strengthFill}
-                  style={{
-                    width: `${pwStrength * 25}%`,
-                    // pwStrength is 1-4; index into array with pwStrength-1
-                    background: strengthColors[pwStrength - 1] || 'transparent',
-                  }}
+          {/* OTP Field for Password Reset */}
+          {mode === 'reset' && (
+             <Field label="6-Digit Reset Code" error={errors.otp}>
+               <InputWrap icon="🔑">
+                 <input
+                   value={form.otp}
+                   onChange={set('otp')}
+                   placeholder="123456"
+                   maxLength={6}
+                   style={{ letterSpacing: '2px', fontFamily: 'var(--mono)' }}
+                 />
+               </InputWrap>
+             </Field>
+          )}
+
+          {/* Password Field (Hidden in Forgot Password mode) */}
+          {mode !== 'forgot' && (
+            <Field label={mode === 'reset' ? "New Password" : "Password"} error={errors.password}>
+              <InputWrap onEye={() => setShowPw(p => !p)} showEye eyeOpen={showPw}>
+                <input
+                  type={showPw ? 'text' : 'password'}
+                  value={form.password}
+                  onChange={set('password')}
+                  placeholder="Min 6 characters"
+                  style={{ paddingRight: 44 }}
                 />
-              </div>
-            )}
-          </Field>
+              </InputWrap>
+              {(mode === 'signup' || mode === 'reset') && form.password && (
+                <div className={styles.strengthBar}>
+                  <div
+                    className={styles.strengthFill}
+                    style={{
+                      width: `${pwStrength * 25}%`,
+                      background: strengthColors[pwStrength - 1] || 'transparent',
+                    }}
+                  />
+                </div>
+              )}
+            </Field>
+          )}
+
+          {/* Forgot Password Link */}
+          {mode === 'login' && (
+            <div style={{ textAlign: 'right', marginTop: '-10px', marginBottom: '14px' }}>
+              <button 
+                type="button" 
+                onClick={() => switchMode('forgot')} 
+                style={{ background: 'none', border: 'none', color: 'var(--accent2)', fontSize: '12px', cursor: 'pointer', fontFamily: 'var(--font)' }}
+              >
+                Forgot Password?
+              </button>
+            </div>
+          )}
 
           <button
             className={styles.submitBtn}
             onClick={handleSubmit}
             disabled={loading}
           >
-            {loading
-              ? <><span className={styles.spinner} /> {mode === 'login' ? 'Signing in…' : 'Creating account…'}</>
-              : mode === 'login' ? 'Sign In →' : 'Create Seller Account →'
-            }
+            {loading ? (
+              <><span className={styles.spinner} /> Processing…</>
+            ) : mode === 'login' ? 'Sign In →' 
+              : mode === 'signup' ? 'Create Seller Account →' 
+              : mode === 'forgot' ? 'Send Reset Code' 
+              : 'Reset Password'}
           </button>
 
           <p className={styles.terms}>
             {mode === 'signup' ? (
               <>By signing up you agree to our <a href="#">Terms</a> and <a href="#">Privacy Policy</a></>
+            ) : mode === 'forgot' || mode === 'reset' ? (
+              <><button onClick={() => switchMode('login')} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)'}}>← Back to Sign In</button></>
             ) : (
-              <>Don't have an account?{' '}
-                <button onClick={() => switchMode('signup')}>Sign up free</button>
-              </>
+              <>Don't have an account? <button onClick={() => switchMode('signup')} style={{ background: 'none', border: 'none', color: 'var(--accent2)', cursor: 'pointer', fontFamily: 'var(--font)'}}>Sign up free</button></>
             )}
           </p>
         </div>
@@ -301,15 +333,6 @@ function Field({ label, error, children }) {
   )
 }
 
-/**
- * InputWrap
- *
- * Previously rendered <span className={styles.inputIcon}>{icon}</span>
- * unconditionally, which placed an empty <span> in the DOM whenever `icon`
- * was undefined (e.g. the email and store-name fields). That empty span
- * occupied padding space and shifted input text. Now the icon span is only
- * rendered when an icon is actually provided.
- */
 function InputWrap({ icon, children, showEye, onEye, eyeOpen }) {
   return (
     <div className={styles.inputWrap}>

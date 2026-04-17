@@ -1,38 +1,48 @@
 """
-PriceIQ — Auth Service
-JWT authentication + email verification + password reset + profile completion
+RocketSales — Auth Service
+JWT authentication + OTP email verification + OTP password reset + profile completion
+
+FIXES:
+  ✅ Replaced URL-based tokens with 6-digit OTPs for email verification
+  ✅ Replaced URL-based tokens with 6-digit OTPs for password resets
+  ✅ OTP expiration enforced at 15 minutes (900 seconds)
+  ✅ Load .env explicitly to ensure SMTP credentials load correctly
 """
 
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from passlib.context import CryptContext
 import jwt
 import os
 import secrets
 import smtplib
+import traceback
 from email.mime.text import MIMEText
 from db import db
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+# ✅ FIX: Load the .env file explicitly before reading the variables
+from dotenv import load_dotenv
+load_dotenv()
+
+router   = APIRouter(prefix="/auth", tags=["auth"])
 security = HTTPBearer()
 
-SECRET_KEY  = os.getenv("JWT_SECRET", "priceiq-secret-change-in-prod")
-ALGORITHM   = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = 24 * 7  # 7 days
+SECRET_KEY                  = os.getenv("JWT_SECRET", "priceiq-secret-change-in-prod")
+ALGORITHM                   = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS   = 24 * 7   # 7 days
 
-# Email config — set these env vars in production
 SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER     = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER)
 APP_BASE_URL  = os.getenv("APP_BASE_URL", "http://localhost:5173")
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Profile fields that count toward "completion"
 PROFILE_COMPLETION_FIELDS = [
     "first_name", "last_name", "store_name",
     "category", "phone", "website", "gstin", "bio",
@@ -73,12 +83,14 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    token:        str
+    email:        EmailStr
+    otp:          str = Field(..., min_length=6, max_length=6)
     new_password: str = Field(..., min_length=6)
 
 
 class VerifyEmailRequest(BaseModel):
-    token: str
+    email: EmailStr
+    otp:   str = Field(..., min_length=6, max_length=6)
 
 
 class TokenResponse(BaseModel):
@@ -89,8 +101,12 @@ class TokenResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def generate_otp(length: int = 6) -> str:
+    """Generate a secure numeric OTP."""
+    return "".join(secrets.choice("0123456789") for _ in range(length))
+
+
 def hash_password(password: str) -> str:
-    # bcrypt silently truncates at 72 bytes
     return pwd_ctx.hash(password[:72])
 
 
@@ -99,19 +115,16 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def create_token(user_id: str) -> str:
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
-        "exp": datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS),
-        "iat": datetime.utcnow(),
+        "exp": now + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS),
+        "iat": now,
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def compute_profile_completion(user: dict) -> int:
-    """
-    US2 — profile completion tracking.
-    Returns 0-100 based on how many profile fields are filled.
-    """
     filled = sum(
         1 for f in PROFILE_COMPLETION_FIELDS
         if user.get(f) and str(user[f]).strip()
@@ -120,7 +133,6 @@ def compute_profile_completion(user: dict) -> int:
 
 
 def user_to_dict(user: dict) -> dict:
-    """Strip sensitive fields and add completion score before returning to client."""
     return {
         "id":                   str(user["_id"]),
         "first_name":           user.get("first_name", ""),
@@ -137,7 +149,6 @@ def user_to_dict(user: dict) -> dict:
         "plan":                 user.get("plan", "free"),
         "api_calls_remaining":  user.get("api_calls_remaining", 100),
         "products_analyzed":    user.get("products_analyzed", 0),
-        # US2: profile completion percentage
         "profile_completion":   compute_profile_completion(user),
         "created_at": (
             user["created_at"].isoformat()
@@ -150,55 +161,70 @@ def user_to_dict(user: dict) -> dict:
 # ── Email sending ─────────────────────────────────────────────────────────────
 
 def _send_email(to: str, subject: str, body: str):
-    """
-    Send a plain-text email via SMTP.
-    Silently logs if SMTP is not configured (dev mode).
-    """
     if not SMTP_USER or not SMTP_PASSWORD:
-        # Dev mode — print to console instead of sending
         print(f"\n[DEV EMAIL] To: {to}\nSubject: {subject}\n{body}\n")
+        print(
+            "[DEV EMAIL] ⚠️  Not sent — SMTP_USER or SMTP_PASSWORD not set in .env\n"
+            "            Make sure .env has SMTP_PASSWORD (not SMTP_PASS) and\n"
+            f"            SMTP_HOST={SMTP_HOST!r} (must be smtp.gmail.com, not your email address)"
+        )
         return
+
     try:
-        msg = MIMEText(body)
+        msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
-        msg["From"]    = SMTP_USER
+        msg["From"]    = SMTP_FROM
         msg["To"]      = to
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.ehlo()
             server.starttls()
+            server.ehlo()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, [to], msg.as_string())
-    except Exception as e:
-        # Non-fatal — log but don't crash the request
-        print(f"[EMAIL ERROR] Failed to send to {to}: {e}")
+
+        print(f"[EMAIL] ✅ Sent to {to} — {subject!r}")
+
+    except smtplib.SMTPAuthenticationError:
+        print(
+            f"[EMAIL] ❌ SMTPAuthenticationError sending to {to}\n"
+            "  → If using Gmail, make sure you're using an App Password (not your login password).\n"
+            "  → Generate one at: https://myaccount.google.com/apppasswords\n"
+            f"  SMTP_HOST={SMTP_HOST!r}  SMTP_USER={SMTP_USER!r}"
+        )
+    except smtplib.SMTPConnectError:
+        print(
+            f"[EMAIL] ❌ SMTPConnectError — could not connect to {SMTP_HOST}:{SMTP_PORT}\n"
+            "  → Check SMTP_HOST in .env (must be 'smtp.gmail.com', not your email address)"
+        )
+    except Exception:
+        print(f"[EMAIL] ❌ Failed to send to {to}:\n{traceback.format_exc()}")
 
 
-def send_verification_email(email: str, token: str):
-    """US1 — email verification."""
-    link = f"{APP_BASE_URL}/verify-email?token={token}"
+def send_verification_email(email: str, otp: str):
     _send_email(
         to=email,
-        subject="Verify your PriceIQ account",
+        subject="Your RocketSales Verification Code",
         body=(
-            f"Hi,\n\nPlease verify your email address by clicking the link below:\n\n"
-            f"{link}\n\n"
-            f"This link expires in 24 hours.\n\n"
-            f"If you did not create a PriceIQ account, you can ignore this email.\n\n"
-            f"— The PriceIQ Team"
+            f"Hi,\n\n"
+            f"Your verification code is: {otp}\n\n"
+            f"Please enter this code in the app to verify your email address.\n"
+            f"This code expires in 15 minutes.\n\n"
+            f"— The RocketSales Team"
         ),
     )
 
 
-def send_password_reset_email(email: str, token: str):
-    """US1 — password reset."""
-    link = f"{APP_BASE_URL}/reset-password?token={token}"
+def send_password_reset_email(email: str, otp: str):
     _send_email(
         to=email,
-        subject="Reset your PriceIQ password",
+        subject="Reset your RocketSales password",
         body=(
-            f"Hi,\n\nYou requested a password reset. Click the link below:\n\n"
-            f"{link}\n\n"
-            f"This link expires in 1 hour. If you did not request this, ignore this email.\n\n"
-            f"— The PriceIQ Team"
+            f"Hi,\n\n"
+            f"You requested a password reset. Your reset code is: {otp}\n\n"
+            f"Please enter this code in the app to reset your password.\n"
+            f"This code expires in 15 minutes. If you didn't request this, ignore this email.\n\n"
+            f"— The RocketSales Team"
         ),
     )
 
@@ -211,8 +237,8 @@ async def get_current_user(
     from bson import ObjectId
     token = credentials.credentials
     try:
-        payload  = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id  = payload.get("sub")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
     except jwt.ExpiredSignatureError:
@@ -234,39 +260,35 @@ async def signup(req: SignupRequest, background_tasks: BackgroundTasks):
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    # US1: generate email verification token
-    verification_token = secrets.token_urlsafe(32)
+    verification_otp = generate_otp()
+    now = datetime.now(timezone.utc)
 
     user_doc = {
-        "first_name":          req.first_name.strip(),
-        "last_name":           req.last_name.strip(),
-        "email":               req.email.lower(),
-        "password_hash":       hash_password(req.password),
-        "store_name":          req.store_name.strip(),
-        "category":            req.category or "",
-        "phone":               req.phone or "",
-        "website":             "",
-        "gstin":               "",
-        "bio":                 "",
-        "notifications":       True,
-        "plan":                "free",
-        "api_calls_remaining": 100,
-        "products_analyzed":   0,
-        # US1: email verification
-        "email_verified":            False,
-        "email_verification_token":  verification_token,
-        "email_verification_sent_at": datetime.utcnow(),
-        "created_at":  datetime.utcnow(),
-        "updated_at":  datetime.utcnow(),
+        "first_name":                 req.first_name.strip(),
+        "last_name":                  req.last_name.strip(),
+        "email":                      req.email.lower(),
+        "password_hash":              hash_password(req.password),
+        "store_name":                 req.store_name.strip(),
+        "category":                   req.category or "",
+        "phone":                      req.phone or "",
+        "website":                    "",
+        "gstin":                      "",
+        "bio":                        "",
+        "notifications":              True,
+        "plan":                       "free",
+        "api_calls_remaining":        100,
+        "products_analyzed":          0,
+        "email_verified":             False,
+        "email_verification_otp":     verification_otp,
+        "email_verification_sent_at": now,
+        "created_at":                 now,
+        "updated_at":                 now,
     }
 
-    result       = await db.users.insert_one(user_doc)
+    result = await db.users.insert_one(user_doc)
     user_doc["_id"] = result.inserted_id
 
-    # Send verification email in the background so signup response is fast
-    background_tasks.add_task(
-        send_verification_email, req.email.lower(), verification_token
-    )
+    background_tasks.add_task(send_verification_email, req.email.lower(), verification_otp)
 
     token = create_token(str(result.inserted_id))
     return TokenResponse(access_token=token, user=user_to_dict(user_doc))
@@ -275,9 +297,17 @@ async def signup(req: SignupRequest, background_tasks: BackgroundTasks):
 @router.post("/login", response_model=TokenResponse)
 async def login(req: LoginRequest):
     user = await db.users.find_one({"email": req.email.lower()})
-    # US1: invalid login shows error
     if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    # Clear stale password reset OTP on login so it can't be used after the fact
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "password_reset_otp": None,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+    )
 
     token = create_token(str(user["_id"]))
     return TokenResponse(access_token=token, user=user_to_dict(user))
@@ -285,22 +315,31 @@ async def login(req: LoginRequest):
 
 @router.post("/verify-email")
 async def verify_email(req: VerifyEmailRequest):
-    """US1 — confirm email address from the link sent on signup."""
-    user = await db.users.find_one({"email_verification_token": req.token})
+    user = await db.users.find_one({"email": req.email.lower()})
+    
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired verification token")
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if user.get("email_verified"):
+        return {"message": "Email is already verified"}
 
-    # Token expires after 24 hours
+    stored_otp = user.get("email_verification_otp")
+    if not stored_otp or stored_otp != req.otp:
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+
     sent_at = user.get("email_verification_sent_at")
-    if sent_at and (datetime.utcnow() - sent_at).total_seconds() > 86400:
-        raise HTTPException(status_code=400, detail="Verification link has expired — please request a new one")
+    if sent_at:
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - sent_at).total_seconds() > 900: # 15 minutes
+            raise HTTPException(status_code=400, detail="Code has expired. Please request a new one.")
 
     await db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {
-            "email_verified":           True,
-            "email_verification_token": None,
-            "updated_at":               datetime.utcnow(),
+            "email_verified":         True,
+            "email_verification_otp": None,
+            "updated_at":             datetime.now(timezone.utc),
         }},
     )
     return {"message": "Email verified successfully"}
@@ -311,64 +350,64 @@ async def resend_verification(
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
 ):
-    """US1 — resend verification email if the user lost the original."""
     if current_user.get("email_verified"):
         return {"message": "Email is already verified"}
 
-    new_token = secrets.token_urlsafe(32)
+    new_otp = generate_otp()
+    
     await db.users.update_one(
         {"_id": current_user["_id"]},
         {"$set": {
-            "email_verification_token":   new_token,
-            "email_verification_sent_at": datetime.utcnow(),
+            "email_verification_otp":     new_otp,
+            "email_verification_sent_at": datetime.now(timezone.utc),
         }},
     )
-    background_tasks.add_task(
-        send_verification_email, current_user["email"], new_token
-    )
-    return {"message": "Verification email resent"}
+    
+    background_tasks.add_task(send_verification_email, current_user["email"], new_otp)
+    return {"message": "A new verification code has been sent"}
 
 
 @router.post("/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest, background_tasks: BackgroundTasks):
-    """US1 — request a password reset link."""
     user = await db.users.find_one({"email": req.email.lower()})
-    # Always return 200 to avoid leaking which emails exist
     if not user:
-        return {"message": "If that email is registered, a reset link has been sent"}
+        return {"message": "If that email is registered, a reset code has been sent"}
 
-    reset_token = secrets.token_urlsafe(32)
+    reset_otp = generate_otp()
     await db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {
-            "password_reset_token":    reset_token,
-            "password_reset_sent_at":  datetime.utcnow(),
+            "password_reset_otp":     reset_otp,
+            "password_reset_sent_at": datetime.now(timezone.utc),
         }},
     )
-    background_tasks.add_task(
-        send_password_reset_email, user["email"], reset_token
-    )
-    return {"message": "If that email is registered, a reset link has been sent"}
+    background_tasks.add_task(send_password_reset_email, user["email"], reset_otp)
+    return {"message": "If that email is registered, a reset code has been sent"}
 
 
 @router.post("/reset-password")
 async def reset_password(req: ResetPasswordRequest):
-    """US1 — set a new password using the token from the reset email."""
-    user = await db.users.find_one({"password_reset_token": req.token})
+    user = await db.users.find_one({"email": req.email.lower()})
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+        raise HTTPException(status_code=400, detail="Invalid request")
 
-    # Token expires after 1 hour
+    stored_otp = user.get("password_reset_otp")
+    if not stored_otp or stored_otp != req.otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+
     sent_at = user.get("password_reset_sent_at")
-    if sent_at and (datetime.utcnow() - sent_at).total_seconds() > 3600:
-        raise HTTPException(status_code=400, detail="Reset link has expired — please request a new one")
+    if sent_at:
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - sent_at).total_seconds() > 900: # 15 minutes
+            raise HTTPException(status_code=400, detail="Reset code has expired — please request a new one")
 
     await db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {
-            "password_hash":        hash_password(req.new_password),
-            "password_reset_token": None,
-            "updated_at":           datetime.utcnow(),
+            "password_hash":      hash_password(req.new_password),
+            "password_reset_otp": None,
+            "updated_at":         datetime.now(timezone.utc),
         }},
     )
     return {"message": "Password reset successfully — please log in"}
@@ -384,9 +423,8 @@ async def update_profile(
     req: UpdateProfileRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """US2 — edit business info; returns updated profile with completion score."""
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
-    updates["updated_at"] = datetime.utcnow()
+    updates["updated_at"] = datetime.now(timezone.utc)
 
     await db.users.update_one({"_id": current_user["_id"]}, {"$set": updates})
     updated = await db.users.find_one({"_id": current_user["_id"]})
@@ -395,5 +433,4 @@ async def update_profile(
 
 @router.post("/logout")
 async def logout(current_user: dict = Depends(get_current_user)):
-    # JWT is stateless — client drops the token
     return {"message": "Logged out successfully"}

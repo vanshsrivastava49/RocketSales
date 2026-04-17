@@ -21,10 +21,17 @@ export default function PriceResult({ result, currentPrice }) {
   const [barWidth, setBarWidth] = useState(0)
 
   useEffect(() => {
-    const t = setTimeout(() => setBarWidth(confidence), 80)
-    return () => clearTimeout(t)
-  }, [confidence])
-
+  const safe = Math.min(Math.max(confidence || 0, 0), 100)
+  const t = setTimeout(() => setBarWidth(safe), 80)
+  return () => clearTimeout(t)
+}, [confidence])
+if (!result) {
+  return (
+    <div className={styles.card}>
+      <div className={styles.heroLabel}>No prediction yet</div>
+    </div>
+  )
+}
   return (
     <div className={styles.card}>
       {/* ── Price Hero ── */}

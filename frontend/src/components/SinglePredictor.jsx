@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import toast from 'react-hot-toast'
 import { predictSingle } from '../api'
+import { useAlerts } from '../contexts/AlertsContext'
 import PriceResult from './PriceResult'
 import styles from './SinglePredictor.module.css'
 
@@ -19,6 +20,7 @@ const INIT = {
 }
 
 export default function SinglePredictor() {
+  const { refresh: refreshAlerts } = useAlerts()
   const [form, setForm]       = useState(INIT)
   const [result, setResult]   = useState(null)
   const [loading, setLoading] = useState(false)
@@ -32,8 +34,8 @@ export default function SinglePredictor() {
 
   const validate = () => {
     const errs = {}
-    if (!form.category)     errs.category = 'Required'
-    if (!form.current_price) errs.current_price = 'Required'
+    if (!form.category)      errs.category      = 'Required'
+    if (!form.current_price) errs.current_price  = 'Required'
     return errs
   }
 
@@ -57,13 +59,31 @@ export default function SinglePredictor() {
     try {
       const data = await predictSingle(payload)
       setResult(data)
-      toast.success('Price recommendation generated!')
+
+      // ✅ FIX: single consolidated toast (was firing up to 2 toasts)
+      const change = data.insights?.change_from_current
+      if (change != null && change <= -5) {
+        toast('⚠️ Price drop recommended — consider reducing your price', { icon: '📉' })
+      } else if (change != null && change >= 5) {
+        toast('💰 Price increase opportunity detected!', { icon: '📈' })
+      } else {
+        toast.success('Price recommendation generated!')
+      }
+
+      // ✅ FIX: refresh alert dropdown immediately after prediction
+      refreshAlerts()
     } catch (err) {
       const msg = err.response?.data?.detail || 'Prediction failed. Is the backend running?'
       toast.error(msg)
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleReset = () => {
+    setForm(INIT)
+    setResult(null)
+    setErrors({})
   }
 
   return (
@@ -143,39 +163,56 @@ export default function SinglePredictor() {
         </div>
 
         <label className={styles.toggle}>
-          <input
-            type="checkbox"
-            checked={form.include_ai_analysis}
-            onChange={set('include_ai_analysis')}
-          />
+          <input type="checkbox" checked={form.include_ai_analysis} onChange={set('include_ai_analysis')} />
           <span>Include AI narrative (requires Anthropic API key)</span>
         </label>
 
-        <button
-          className={styles.btnPredict}
-          onClick={handleSubmit}
-          disabled={loading}
-        >
-          {loading ? (
-            <><span className={styles.spinner} /> Generating…</>
-          ) : (
-            '⚡ Get Price Recommendation'
+        <div className={styles.btnRow}>
+          <button className={styles.btnPredict} onClick={handleSubmit} disabled={loading}>
+            {loading ? <><span className={styles.spinner} /> Generating…</> : '⚡ Get Price Recommendation'}
+          </button>
+          {result && (
+            <button className={styles.btnReset} onClick={handleReset}>
+              ↺ Reset
+            </button>
           )}
-        </button>
+        </div>
       </div>
 
-      {/* ── Result ── */}
+      {/* ── Result / Skeleton ── */}
       <div>
-        {result
-          ? <PriceResult result={result} currentPrice={parseFloat(form.current_price) || null} />
-          : (
-            <div className={styles.emptyState}>
-              <div className={styles.emptyIcon}>📊</div>
-              <p>Fill in your product details and click <strong>Get Price Recommendation</strong> to receive an AI-powered optimal price with strategic rationale.</p>
-            </div>
-          )
-        }
+        {loading ? (
+          <ResultSkeleton />
+        ) : result ? (
+          <PriceResult result={result} currentPrice={parseFloat(form.current_price) || null} />
+        ) : (
+          <div className={styles.emptyState}>
+            <div className={styles.emptyIcon}>📊</div>
+            <p>Fill in your product details and click <strong>Get Price Recommendation</strong> to receive an AI-powered optimal price with strategic rationale.</p>
+          </div>
+        )}
       </div>
+    </div>
+  )
+}
+
+function ResultSkeleton() {
+  return (
+    <div style={{
+      background: 'var(--bg2)', border: '1px solid var(--border)',
+      borderRadius: 16, padding: 24, display: 'flex', flexDirection: 'column', gap: 16,
+    }}>
+      {[80, 48, 24, 60, 36].map((w, i) => (
+        <div key={i} style={{
+          height: i === 0 ? 40 : 16,
+          width: `${w}%`,
+          background: 'var(--border2)',
+          borderRadius: 6,
+          animation: 'pulse 1.5s ease-in-out infinite',
+          opacity: 0.6,
+        }} />
+      ))}
+      <style>{`@keyframes pulse{0%,100%{opacity:.4}50%{opacity:.8}}`}</style>
     </div>
   )
 }

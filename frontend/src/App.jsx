@@ -2,6 +2,7 @@ import { Toaster } from 'react-hot-toast'
 import { AuthProvider, useAuth } from './contexts/AuthContext'
 import AuthPage from './pages/AuthPage'
 import AppShell from './components/AppShell'
+import { AlertsProvider } from './contexts/AlertsContext'
 
 function AppRouter() {
   const { user, loading } = useAuth()
@@ -22,17 +23,23 @@ function AppRouter() {
     </div>
   )
 
-  return user ? <AppShell /> : <AuthPage />
+  // ✅ FIX: Only render AlertsProvider when user is authenticated.
+  // Previously AlertsProvider was always mounted, so it tried to fetch
+  // /alerts/history before login and on every unauthenticated render,
+  // flooding the backend with 401s and causing the context to throw
+  // during the login→dashboard transition before `user` was set.
+  if (!user) return <AuthPage />
+
+  return (
+    <AlertsProvider>
+      <AppShell />
+    </AlertsProvider>
+  )
 }
 
 export default function App() {
   return (
     <AuthProvider>
-      {/*
-        Toast styles use CSS variables so they adapt to light/dark mode
-        automatically. Previously hardcoded dark hex values (#1a1a26 etc.)
-        were baked in, making toasts invisible in light-mode themes.
-      */}
       <Toaster
         position="bottom-right"
         toastOptions={{
