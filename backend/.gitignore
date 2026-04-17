@@ -1,4 +1,4 @@
-.env.example
+.env
 amazon_rocketsales_5000.csv
 final_merged_dataset.csv
 flipkart_final_realistic.csv
